@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chain</title>
+<style>
+  :root { --bg:#070608; --fg:#f2efec; --accent:#ffffff; color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  html { background: var(--bg); }
+  body { color: var(--fg); font-family: "Helvetica Neue", Arial, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  section { position: relative; height: 100vh; display: flex; align-items: flex-end;
+            padding: 8vh 7vw; pointer-events: none; }
+  section:nth-child(even) { justify-content: flex-end; text-align: right; }
+  h1, h2 { font-size: clamp(2.6rem, 9vw, 7rem); line-height: .95; font-weight: 800;
+           letter-spacing: -0.04em; max-width: 12ch; text-shadow: 0 2px 30px #0008; }
+  p { margin-top: 1rem; max-width: 34ch; font-size: 1.05rem; line-height: 1.5; opacity: .75; }
+  #bar { position: fixed; left: 0; top: 0; height: 3px; width: 0; background: var(--accent); z-index: 5; }
+  #hint { position: fixed; top: 4vh; left: 7vw; font-size: .85rem; opacity: .6; z-index: 5;
+          transition: opacity .6s; }
+</style>
+</head>
+<body>
+<div id="bar"></div>
+<div id="hint">Scroll to pull the chain. Move your pointer to tilt it.</div>
+<canvas id="c"></canvas>
+<section><div><h1>Pull the chain.</h1><p>Eighty chrome links, one draw call, sliding along a curve.</p></div></section>
+<section><div><h2>Heat.</h2><p>The light turns red. The chrome follows without any extra work.</p></div></section>
+<section><div><h2>Cold.</h2><p>Cyan light, same metal. Reflections do the colouring.</p></div></section>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  const N = 80;                                   // links
+  const SECTION_COLORS = [0xffffff, 0xff2020, new THREE.Color(80/255, 220/255, 1).getHex()];
+  const canvas = document.getElementById('c');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x070608);
+  scene.fog = new THREE.Fog(0x070608, 14, 30);
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.set(0, 0, 14);
+
+  // 7. Material + environment map (procedural studio so chrome has something to reflect)
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const envScene = new THREE.Scene();
+  envScene.add(new THREE.Mesh(new THREE.BoxGeometry(30, 30, 30),
+    new THREE.MeshBasicMaterial({ color: 0x050505, side: THREE.BackSide })));
+  const panelMats = [];
+  [[0, 12, 0, -Math.PI/2, 0, 14, 14], [-12, 2, 0, 0, Math.PI/2, 8, 16],
+   [12, 0, 4, 0, -Math.PI/2, 5, 14], [0, -2, 12, 0, Math.PI, 18, 4]].forEach(p => {
+    const m = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(p[5], p[6]), m);
+    mesh.position.set(p[0], p[1], p[2]); mesh.rotation.set(p[3], p[4], 0);
+    envScene.add(mesh); panelMats.push(m);
+  });
+  let envRT = null;
+  function bakeEnv() { if (envRT) envRT.dispose(); envRT = pmrem.fromScene(envScene, 0.04); scene.environment = envRT.texture; }
+  bakeEnv();
+
+  const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 1, roughness: 0.2, envMapIntensity: 1.3 });
+
+  // 1. One link = stretched torus
+  const geo = new THREE.TorusGeometry(0.5, 0.12, 20, 48);
+  // 2. 80 copies, one draw call
+  const chain = new THREE.InstancedMesh(geo, mat, N);
+  chain.frustumCulled = false;
+  scene.add(chain);
+
+  const key = new THREE.PointLight(0xffffff, 40, 40); key.position.set(4, 4, 8); scene.add(key);
+  const rim = new THREE.PointLight(0xffffff, 30, 40); rim.position.set(-6, -3, 6); scene.add(rim);
+
+  // 3. Path through points across every section (rebuilt on resize so it fits narrow screens)
+  let curve, linkScale = 0.5;
+  function buildCurve() {
+    const w = Math.min(1, camera.aspect / 1.4);
+    const P = [[10, 9, -3], [-5, 5.5, 1], [5, 1.5, 3], [-5.5, -2.5, 0], [5, -6, 2], [-10, -10, -2]];
+    curve = new THREE.CatmullRomCurve3(P.map(p => new THREE.Vector3(p[0] * w, p[1], p[2])));
+    // link pitch is about 1.1 units at scale 1, so size links to fill the path evenly
+    linkScale = curve.getLength() / N / 1.1;
+  }
+  function resize() {
+    renderer.setSize(innerWidth, innerHeight, false);
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    buildCurve();
+  }
+  addEventListener('resize', resize); resize();
+
+  // Scroll state
+  let scrollTarget = 0, scroll = 0, vel = 0, mx = 0, my = 0;
+  const maxScroll = () => Math.max(1, document.body.scrollHeight - innerHeight);
+  addEventListener('scroll', () => { scrollTarget = scrollY; hint.style.opacity = 0; }, { passive: true });
+  addEventListener('pointermove', e => { mx = e.clientX / innerWidth - .5; my = e.clientY / innerHeight - .5; });
+  const hint = document.getElementById('hint'), bar = document.getElementById('bar');
+
+  const up = new THREE.Vector3(0, 1, 0), tan = new THREE.Vector3(), pos = new THREE.Vector3();
+  const qAlign = new THREE.Quaternion(), qTwist = new THREE.Quaternion(), scl = new THREE.Vector3(), m4 = new THREE.Matrix4();
+  const target = new THREE.Color(), current = new THREE.Color(0xffffff);
+
+  function tick(time) {
+    const t = time / 1000;
+    const prev = scroll;
+    scroll += (scrollTarget - scroll) * 0.08;            // inertia
+    vel += ((scroll - prev) - vel) * 0.2;
+    const progress = scroll / maxScroll();
+    // 6. Scroll moves the offset
+    const offset = scroll * 0.0009 + t * 0.004;
+
+    for (let i = 0; i < N; i++) {
+      // 4. Link i sits at t = (i / N + offset) % 1
+      const u = (((i / N + offset) % 1) + 1) % 1;
+      curve.getPointAt(u, pos);
+      curve.getTangentAt(u, tan);
+      pos.x += Math.sin(t * 1.3 + u * 12) * 0.06 + vel * 0.02 * Math.sin(i);   // sway, rattle when pulled
+      qAlign.setFromUnitVectors(up, tan);
+      // 5. Every second link turns 90 degrees around the tangent
+      qTwist.setFromAxisAngle(up, (i % 2) * Math.PI / 2);
+      qAlign.multiply(qTwist);
+      scl.set(linkScale, linkScale * 1.6, linkScale);   // scale y 1.6
+      m4.compose(pos, qAlign, scl);
+      chain.setMatrixAt(i, m4);
+    }
+    chain.instanceMatrix.needsUpdate = true;
+    chain.rotation.set(my * 0.25, mx * 0.35, 0);
+
+    // 8. Light colour per section, blended smoothly
+    const f = Math.min(progress * 2, 2), a = Math.floor(f), b = Math.min(a + 1, 2);
+    target.set(SECTION_COLORS[a]).lerp(new THREE.Color(SECTION_COLORS[b]), f - a);
+    if (current.distanceTo(target) > 0.002) {
+      current.lerp(target, 0.06);
+      key.color.copy(current); rim.color.copy(current);
+      panelMats.forEach((m, i) => m.color.copy(i % 2 ? current : new THREE.Color(0xffffff).lerp(current, .6)));
+      if (Math.round(t * 60) % 2 === 0) bakeEnv();
+      document.documentElement.style.setProperty('--accent', '#' + current.getHexString());
+    }
+    bar.style.width = (progress * 100) + '%';
+    camera.position.x += (mx * 1.2 - camera.position.x) * 0.05;
+    camera.lookAt(0, 0, 0);
+    renderer.render(scene, camera);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
